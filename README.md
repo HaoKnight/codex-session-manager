@@ -72,8 +72,8 @@ Tauri 的完整环境准备请参阅 [官方前置要求](https://v2.tauri.app/s
 
 ```bash
 # 克隆仓库
-git clone https://github.com/HaoKnight/Codex-session-management.git
-cd Codex-session-management
+git clone https://github.com/HaoKnight/codex-session-manager.git
+cd codex-session-manager
 
 # 安装前端依赖
 npm install
