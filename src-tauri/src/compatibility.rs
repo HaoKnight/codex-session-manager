@@ -49,6 +49,17 @@ fn history_tables(conn: &Connection, schema: &str) -> Result<Vec<String>, String
     Ok(tables)
 }
 
+fn sqlite_read_only_uri(path: &Path) -> Result<String, String> {
+    let path = path.to_str().ok_or("数据库路径不是有效的 UTF-8，无法创建只读 URI。")?;
+    // SQLite decodes the path before passing it to the filesystem. Encode separators
+    // too so Windows verbatim/UNC prefixes cannot become a URI authority, while
+    // preserving the original path (including long-path prefixes and Unix backslashes).
+    let encoded = path.bytes()
+        .map(|byte| if byte.is_ascii_alphanumeric() || b".-_~".contains(&byte) { (byte as char).to_string() } else { format!("%{byte:02X}") })
+        .collect::<String>();
+    Ok(format!("file:{encoded}?mode=ro"))
+}
+
 pub(super) fn snapshot_history(home: &Path, destination: &Path, ids: &[String]) -> Result<Option<BackupFileEntry>, String> {
     let source = history_database(home);
     if !source.is_file() { return Ok(None); }
@@ -65,9 +76,8 @@ pub(super) fn snapshot_history(home: &Path, destination: &Path, ids: &[String]) 
     let result = (|| -> Result<(), String> {
         let mut conn = Connection::open(&partial).map_err(|e| e.to_string())?;
         for sql in schemas { conn.execute_batch(&sql).map_err(|e| e.to_string())?; }
-        let encoded = fs::canonicalize(&source).map_err(|e| e.to_string())?.to_string_lossy().replace('\\', "/").bytes()
-            .map(|byte| if byte.is_ascii_alphanumeric() || b"/:.-_~".contains(&byte) { (byte as char).to_string() } else { format!("%{byte:02X}") }).collect::<String>();
-        conn.execute("ATTACH DATABASE ?1 AS source_history", params![format!("file:{encoded}?mode=ro")]).map_err(|e| e.to_string())?;
+        let source_path = fs::canonicalize(&source).map_err(|e| e.to_string())?;
+        conn.execute("ATTACH DATABASE ?1 AS source_history", params![sqlite_read_only_uri(&source_path)?]).map_err(|e| e.to_string())?;
         conn.execute_batch("CREATE TEMP TABLE scoped_history_threads (id TEXT PRIMARY KEY)").map_err(|e| e.to_string())?;
         let transaction = conn.transaction().map_err(|e| e.to_string())?;
         for id in ids { transaction.execute("INSERT OR IGNORE INTO scoped_history_threads VALUES (?1)", params![id]).map_err(|e| e.to_string())?; }

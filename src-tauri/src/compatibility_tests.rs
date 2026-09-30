@@ -49,8 +49,37 @@ fn modern_path_repair_preserves_unrelated_roots_chat_bytes_and_newlines() {
 }
 
 #[test]
+fn sqlite_read_only_uris_preserve_windows_path_prefixes() {
+    for (path, expected) in [
+        (r"C:\data\history.sqlite", "file:C%3A%5Cdata%5Chistory.sqlite?mode=ro"),
+        (r"\\?\C:\data\history.sqlite", "file:%5C%5C%3F%5CC%3A%5Cdata%5Chistory.sqlite?mode=ro"),
+        (r"\\server\share\history.sqlite", "file:%5C%5Cserver%5Cshare%5Chistory.sqlite?mode=ro"),
+        (r"\\?\UNC\server\share\history.sqlite", "file:%5C%5C%3F%5CUNC%5Cserver%5Cshare%5Chistory.sqlite?mode=ro"),
+    ] {
+        assert_eq!(sqlite_read_only_uri(Path::new(path)).unwrap(), expected);
+    }
+}
+
+#[test]
+fn sqlite_uri_attaches_special_paths_read_only() {
+    let fixture = Fixture::new();
+    let directory = fixture.0.join("中文 space #%&");
+    fs::create_dir(&directory).unwrap();
+    let path = directory.join("history.sqlite");
+    let source = Connection::open(&path).unwrap();
+    source.execute_batch("CREATE TABLE items(value TEXT); INSERT INTO items VALUES ('original')").unwrap();
+    let conn = Connection::open_in_memory().unwrap();
+    let canonical = fs::canonicalize(&path).unwrap();
+    conn.execute("ATTACH DATABASE ?1 AS source_history", params![sqlite_read_only_uri(&canonical).unwrap()]).unwrap();
+    assert_eq!(conn.query_row("SELECT value FROM source_history.items", [], |row| row.get::<_, String>(0)).unwrap(), "original");
+    let error = conn.execute("UPDATE source_history.items SET value = 'changed'", []).unwrap_err();
+    assert_eq!(error.sqlite_error_code(), Some(rusqlite::ErrorCode::ReadOnly));
+    assert_eq!(source.query_row("SELECT value FROM items", [], |row| row.get::<_, String>(0)).unwrap(), "original");
+}
+
+#[test]
 fn snapshots_and_copies_only_selected_history_and_preserves_migrations() {
-    let fixture = Fixture::new(); let home = fixture.0.join("home"); let package = fixture.0.join("package");
+    let fixture = Fixture::new(); let home = fixture.0.join("home 中文 #%&"); let package = fixture.0.join("package");
     fs::create_dir(&home).unwrap(); fs::create_dir(&package).unwrap();
     let source = Connection::open(home.join(HISTORY_FILE)).unwrap(); create_history(&source, "main");
     source.execute_batch("INSERT INTO thread_turns VALUES ('kept','t',0,100), ('other','t',0,200); INSERT INTO thread_items VALUES ('kept','i','kept payload'), ('other','i','private payload'); INSERT INTO thread_history_projection_state VALUES ('kept',100,2), ('other',200,3)").unwrap();
