@@ -109,6 +109,8 @@ npm run tauri build -- --bundles nsis
 
 构建产物位于 `src-tauri/target/release/bundle/`。公开分发前，请为 macOS 应用完成开发者签名与公证，并为 Windows 安装包配置代码签名。
 
+Windows NSIS 安装包采用所有用户安装模式，默认安装到 Program Files，安装和卸载时通过 UAC 请求管理员权限。应用日常启动仍使用当前用户权限。
+
 ## 🚀 使用说明
 
 ### 1. 扫描会话
