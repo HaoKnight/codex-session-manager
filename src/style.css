@@ -64,4 +64,45 @@ html[data-theme="light"] .empty { color: #404040; } html[data-theme="light"] .em
 html[data-theme="light"] .sidebar-author { border-color: #dedede; background: #f7f7f7; }
 html[data-theme="light"] .github-link { border-color: #d2d2d2; background: #fff; color: #666666; } html[data-theme="light"] .github-link:hover { border-color: #999999; background: #ededed; color: #222222; }
 html[data-theme="light"] .delete-confirmation-modal { border-color: #e2b0b5; } html[data-theme="light"] .delete-confirmation-modal .danger-eyebrow { color: #a4313d; } html[data-theme="light"] .deletion-kind { background: #f7dfe2; color: #96313c; }
+/* Draw the selection mark explicitly so native WebView checkbox colors do not
+   lose contrast against the application's theme. Keep native input semantics. */
+html .modal input[type="checkbox"] {
+  --checkbox-selected: #81e3aa;
+  -webkit-appearance: none;
+  appearance: none;
+  display: inline-grid;
+  place-content: center;
+  padding: 0;
+  border: 1px solid var(--accent-muted);
+  border-radius: 3px;
+  background: var(--accent-soft);
+  color: var(--checkbox-selected);
+  cursor: pointer;
+}
+html[data-theme="light"] .modal input[type="checkbox"] { --checkbox-selected: #197044; }
+html .modal input[type="checkbox"]::before {
+  content: "";
+  width: 9px;
+  height: 5px;
+  border-left: 2px solid currentColor;
+  border-bottom: 2px solid currentColor;
+  transform: translateY(-1px) rotate(-45deg);
+  opacity: 0;
+}
+html .modal input[type="checkbox"]:checked,
+html .modal input[type="checkbox"]:indeterminate { border-color: var(--checkbox-selected); }
+html .modal input[type="checkbox"]:checked::before { opacity: 1; }
+html .modal input[type="checkbox"]:indeterminate::before {
+  width: 8px;
+  height: 0;
+  border-left: 0;
+  transform: none;
+  opacity: 1;
+}
+html .modal input[type="checkbox"]:focus-visible { outline: 2px solid var(--accent-focus); outline-offset: 2px; }
+html .modal input[type="checkbox"]:disabled { opacity: .45; cursor: not-allowed; }
+@media (forced-colors: active) {
+  html .modal input[type="checkbox"] { -webkit-appearance: auto; appearance: auto; }
+  html .modal input[type="checkbox"]::before { display: none; }
+}
 @media (max-width: 1100px) { #app { padding: 20px 24px 36px; }.summary-grid { grid-template-columns: repeat(3, 1fr); }.workspace { grid-template-columns: 180px minmax(0, 1fr); }.source-note { display: none; }.tabs-row { align-items: stretch; flex-wrap: wrap; gap: 10px; margin-top: 14px; }.tabs-row > .source-actions { order: -1; margin-left: auto; padding-bottom: 0; }.tabs { flex-basis: 100%; } }

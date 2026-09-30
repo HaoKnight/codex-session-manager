@@ -5,7 +5,7 @@
 
   **核查、修复、迁移与备份 Codex 会话**
 
-  [![Version](https://img.shields.io/badge/version-1.2.0-4c9f70.svg)](./src-tauri/tauri.conf.json)
+  [![Version](https://img.shields.io/badge/version-1.3.0-4c9f70.svg)](./src-tauri/tauri.conf.json)
   [![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Windows-607d8b.svg)](#-系统要求)
   [![Tauri](https://img.shields.io/badge/Tauri-2-24c8db.svg)](https://tauri.app/)
   [![Rust](https://img.shields.io/badge/Rust-2021-e57324.svg)](https://www.rust-lang.org/)
@@ -42,7 +42,7 @@ Codex 会话管理是一款基于 Tauri + Rust 的本地桌面工具，用于检
 
 ### 📦 会话导出
 
-导出界面支持按项目折叠、展开和批量选择会话，并将数据库快照、项目配置、会话关系及 JSONL 日志整理为迁移包。
+导出界面支持按项目折叠、展开和批量选择会话，并将数据库快照、项目配置、会话关系、JSONL 日志及新版分页历史整理为迁移包。
 
 <div align="center">
   <img src="./screenshot/会话导出.png" alt="Codex 会话管理的会话导出界面" width="100%" />
@@ -130,11 +130,13 @@ npm run tauri build -- --bundles nsis
 ### 3. 导出与导入会话
 
 1. 点击页面标签栏右侧的“导出会话”
-2. 按项目选择需要迁移的会话，并指定导出目录
+2. 按项目选择需要迁移的会话，指定导出目录，完全退出 Codex 后导出
 3. 在另一台电脑点击页面标签栏右侧的“导入会话”
 4. 选择导出包中的 `manifest.json`
 5. 为导出包中的每个项目选择当前电脑上的项目目录
-6. 关闭 Codex 后确认导入；应用会同步转换数据库、侧栏项目归属和 JSONL 日志中的工作目录
+6. 关闭 Codex 后确认导入；应用会同步转换工作目录、工作区和权限路径，并恢复分页历史与侧栏项目归属
+
+新版迁移包采用 v2 格式，包含所选会话的分页历史。旧版普通会话包仍可导入；使用分页历史的旧包若缺少历史数据库，会明确拒绝导入，需重新导出完整迁移包。
 
 ### 4. 删除与恢复
 
@@ -156,8 +158,10 @@ npm run tauri build -- --bundles nsis
 ## 🛡️ 安全机制
 
 - 修复、删除和回退操作均先创建本地备份；导入操作不创建额外备份
-- 修复、导入和回退前会检查 Codex 是否已完全退出，避免运行中的进程写回旧数据
-- JSONL 修复只替换精确匹配的 `cwd` 字段，不改写聊天内容中的路径或文件链接
+- 导出、修复、导入、删除和回退前会检查 Codex 是否已完全退出，避免运行中的进程导致快照不一致或写回旧数据
+- 路径修复只更新结构化运行元数据中的工作目录、工作区和权限路径，不改写聊天内容、工具执行记录中的路径或文件链接
+- 重写日志时同步更新分页历史的字节位置索引；发现索引不一致、缺少历史数据或无法识别的新结构时取消操作
+- 修复和恢复同时更新状态库与历史库；文件写入失败时回滚 SQL，并恢复已经写入的日志和侧栏状态
 - 子代理级联修复要求范围内的会话日志完整，否则整次操作在写入前取消
 - 导入包采用路径边界校验，并核对会话 ID 与日志归属
 - 删除目标限制在 Codex 管理的数据范围内，并保留可核查的操作清单
@@ -171,6 +175,7 @@ npm run tauri build -- --bundles nsis
 | 数据 | 默认位置 | 用途 |
 | --- | --- | --- |
 | 状态数据库 | `~/.codex/state_5.sqlite` 或 `~/.codex/sqlite/state_5.sqlite` | 项目、会话及工作目录 |
+| 分页历史数据库 | `~/.codex/thread_history_1.sqlite` 或 `~/.codex/sqlite/thread_history_1.sqlite` | 新版会话内容、历史分页及日志位置索引 |
 | 当前会话日志 | `~/.codex/sessions/` | 当前 JSONL 会话记录 |
 | 已归档会话日志 | `~/.codex/archived_sessions/` | 已归档 JSONL 会话记录 |
 | 桌面目录缓存 | `~/.codex/sqlite/codex-dev.db` | Codex 会话目录缓存 |

@@ -18,6 +18,9 @@ use tauri::{
 use tauri::menu::{AboutMetadata, PredefinedMenuItem};
 use walkdir::WalkDir;
 
+mod compatibility;
+use compatibility::*;
+
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct Project {
@@ -189,6 +192,8 @@ struct ExportLog {
     thread_id: String,
     file: String,
     archived: bool,
+    #[serde(default)]
+    canonical: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -203,6 +208,10 @@ struct SessionExportManifest {
     #[serde(default)]
     project_assignments: HashMap<String, String>,
     logs: Vec<ExportLog>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    history_database: Option<String>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    thread_path_settings: HashMap<String, HashMap<String, Value>>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -275,6 +284,10 @@ struct ThreadRepairChange {
     session_title: String,
     source_cwd: String,
     target_cwd: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    sandbox_policy: Option<String>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    desktop_path_settings: HashMap<String, Value>,
 }
 
 #[derive(Debug, Serialize)]
@@ -355,6 +368,7 @@ struct RepairTarget {
     id: String,
     title: String,
     cwd: String,
+    rollout_path: String,
     logs: Vec<LogMeta>,
 }
 
@@ -452,9 +466,28 @@ fn is_same_path(left: &str, right: &str) -> bool {
     normalized(left) == normalized(right)
 }
 
+fn resolved_file_path(path: &Path) -> PathBuf {
+    let mut ancestor = path;
+    let mut suffix = Vec::new();
+    loop {
+        if let Ok(mut resolved) = fs::canonicalize(ancestor) {
+            for name in suffix.into_iter().rev() { resolved.push(name); }
+            return resolved;
+        }
+        let (Some(parent), Some(name)) = (ancestor.parent(), ancestor.file_name()) else { return path.to_path_buf() };
+        suffix.push(name); ancestor = parent;
+    }
+}
+
+fn same_file_path(left: &Path, right: &Path) -> bool {
+    left == right || is_same_path(&display_path(&resolved_file_path(left)), &display_path(&resolved_file_path(right)))
+}
+
 fn is_managed_log(home: &Path, path: &Path) -> bool {
-    let in_sessions = path.starts_with(home.join("sessions"));
-    let in_archived = path.starts_with(home.join("archived_sessions"));
+    if path.components().any(|part| matches!(part, std::path::Component::ParentDir)) { return false; }
+    let resolved = resolved_file_path(path);
+    let in_sessions = resolved.starts_with(resolved_file_path(&home.join("sessions")));
+    let in_archived = resolved.starts_with(resolved_file_path(&home.join("archived_sessions")));
     (in_sessions || in_archived) && path.extension().is_some_and(|ext| ext == "jsonl")
 }
 
@@ -550,20 +583,23 @@ fn load_repair_targets(
 
     let mut statement = conn
         .prepare(
-            "SELECT id, cwd, COALESCE(NULLIF(TRIM(name), ''), title)
+            "SELECT id, cwd, COALESCE(NULLIF(TRIM(name), ''), title), rollout_path
              FROM threads WHERE id = ?1",
         )
         .map_err(|e| format!("无法读取目标会话：{e}"))?;
     let mut targets = Vec::new();
     for id in ids {
-        let (id, cwd, title) = statement
-            .query_row(params![id], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?)))
+        let (id, cwd, title, rollout_path) = statement
+            .query_row(params![id], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, String>(3)?)))
             .map_err(|e| format!("未找到{}：{e}", if id == root_thread_id { "目标会话" } else { "子代理会话" }))?;
         let logs = logs_by_id.get(&id).cloned().unwrap_or_default();
         if logs.is_empty() {
             return Err(format!("找不到{}“{title}”的 JSONL 日志，已拒绝修改任何会话。", if id == root_thread_id { "目标会话" } else { "子代理会话" }));
         }
-        targets.push(RepairTarget { id, title, cwd, logs });
+        if !logs.iter().any(|log| same_file_path(&log.path, Path::new(&rollout_path))) {
+            return Err(format!("找不到会话“{title}”当前数据库引用的日志，已拒绝修改。"));
+        }
+        targets.push(RepairTarget { id, title, cwd, rollout_path, logs });
     }
     Ok(targets)
 }
@@ -594,7 +630,7 @@ fn scan_logs(home: &Path) -> Vec<LogMeta> {
         if !folder.is_dir() { continue; }
         for entry in WalkDir::new(folder).follow_links(false).into_iter().flatten() {
             let path = entry.path();
-            if path.is_file() && path.extension().is_some_and(|ext| ext == "jsonl") {
+            if path.is_file() && is_managed_log(home, path) {
                 if let Some(log) = parse_log(path, archived) { logs.push(log); }
             }
         }
@@ -625,7 +661,7 @@ fn read_export_manifest(path: &Path) -> Result<SessionExportManifest, String> {
     let content = fs::read_to_string(path).map_err(|e| format!("无法读取导出包清单：{e}"))?;
     let manifest: SessionExportManifest = serde_json::from_str(&content)
         .map_err(|e| format!("导出包清单格式无效：{e}"))?;
-    if manifest.format != "codex-session-manager-export" || manifest.version != 1 {
+    if manifest.format != "codex-session-manager-export" || !(1..=2).contains(&manifest.version) {
         return Err("这不是受支持的 Codex 会话导出包。".into());
     }
     if manifest.thread_ids.is_empty() || manifest.visible_thread_ids.is_empty() {
@@ -639,6 +675,108 @@ fn read_export_manifest(path: &Path) -> Result<SessionExportManifest, String> {
         return Err("导出包中的主会话范围无效。".into());
     }
     Ok(manifest)
+}
+
+fn quote_sql_identifier(identifier: &str) -> String {
+    format!("\"{}\"", identifier.replace('"', "\"\""))
+}
+
+fn database_table_exists(conn: &Connection, schema: &str, table: &str) -> Result<bool, String> {
+    conn.query_row(
+        &format!("SELECT EXISTS(SELECT 1 FROM {}.sqlite_master WHERE type = 'table' AND name = ?1)", quote_sql_identifier(schema)),
+        params![table],
+        |row| row.get(0),
+    ).map_err(|e| format!("无法检查数据库表 {schema}.{table}：{e}"))
+}
+
+fn database_table_columns(conn: &Connection, schema: &str, table: &str) -> Result<Vec<String>, String> {
+    let mut statement = conn.prepare(&format!(
+        "PRAGMA {}.table_info({})", quote_sql_identifier(schema), quote_sql_identifier(table)
+    )).map_err(|e| format!("无法检查数据库字段 {schema}.{table}：{e}"))?;
+    let rows = statement.query_map([], |row| row.get::<_, String>(1))
+        .map_err(|e| format!("无法读取数据库字段 {schema}.{table}：{e}"))?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(|e| format!("无法读取数据库字段 {schema}.{table}：{e}"))
+}
+
+// Copy by column name: newer Codex versions can add nullable/defaulted fields
+// and snapshots can store the same fields in a different order.
+fn copy_database_rows(
+    conn: &Connection,
+    source_schema: &str,
+    table: &str,
+    row_filter: &str,
+    ignore_conflicts: bool,
+) -> Result<(), String> {
+    copy_database_rows_into(conn, source_schema, "main", table, row_filter, ignore_conflicts)
+}
+
+fn copy_database_rows_into(
+    conn: &Connection, source_schema: &str, target_schema: &str,
+    table: &str, row_filter: &str, ignore_conflicts: bool,
+) -> Result<(), String> {
+    let source_columns = database_table_columns(conn, source_schema, table)?;
+    let target_columns = database_table_columns(conn, target_schema, table)?;
+    if source_columns.is_empty() || target_columns.is_empty() {
+        return Err(format!("源数据库或当前数据库缺少 {table} 表。"));
+    }
+    // INSERT OR IGNORE must not silently discard rows when a newer schema adds
+    // a required field that an older snapshot cannot supply.
+    let mut required = conn.prepare("SELECT name FROM pragma_table_info(?1, ?2) WHERE \"notnull\" = 1 AND dflt_value IS NULL")
+        .map_err(|e| e.to_string())?;
+    let required_columns = required.query_map(params![table, target_schema], |row| row.get::<_, String>(0))
+        .map_err(|e| e.to_string())?
+        .collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())?;
+    for column in required_columns {
+        if !source_columns.contains(&column) {
+            return Err(format!("导出包或备份缺少 {table}.{column} 必需字段，请使用兼容的 Codex 版本后重试。"));
+        }
+    }
+    let columns = target_columns.iter().filter(|column| source_columns.contains(column))
+        .map(|column| quote_sql_identifier(column)).collect::<Vec<_>>().join(", ");
+    if columns.is_empty() { return Err(format!("源数据库与当前数据库的 {table} 表没有兼容字段。")); }
+    let insert = if ignore_conflicts { "INSERT OR IGNORE" } else { "INSERT" };
+    let table = quote_sql_identifier(table);
+    conn.execute(&format!(
+        "{insert} INTO {}.{table} ({columns}) SELECT {columns} FROM {}.{table} WHERE {row_filter}",
+        quote_sql_identifier(target_schema), quote_sql_identifier(source_schema),
+    ), []).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+// Codex migration 55 renamed both the table and its type column. Detect each
+// database independently so old exports/deletion backups remain importable.
+const THREAD_ATTACHMENT_TABLES: [(&str, &str); 2] = [
+    ("thread_attachments", "attachment_type"),
+    ("thread_artifacts", "artifact_type"),
+];
+
+fn copy_thread_attachments(conn: &Connection, source_schema: &str, scope_table: &str) -> Result<(), String> {
+    let mut target = None;
+    for (table, type_column) in THREAD_ATTACHMENT_TABLES {
+        if database_table_exists(conn, "main", table)? {
+            target = Some((table, type_column));
+            break;
+        }
+    }
+    let row_filter = format!("thread_id IN (SELECT id FROM {})", quote_sql_identifier(scope_table));
+    for (source_table, source_type_column) in THREAD_ATTACHMENT_TABLES {
+        if !database_table_exists(conn, source_schema, source_table)? { continue; }
+        let source = format!("{}.{}", quote_sql_identifier(source_schema), quote_sql_identifier(source_table));
+        let Some((target_table, target_type_column)) = target else {
+            let has_rows: bool = conn.query_row(
+                &format!("SELECT EXISTS(SELECT 1 FROM {source} WHERE {row_filter})"),
+                [], |row| row.get(0),
+            ).map_err(|e| e.to_string())?;
+            if has_rows { return Err("当前 Codex 数据库不支持会话附件，请升级 Codex 后重试；操作已取消以免丢失附件。".into()); }
+            continue;
+        };
+        conn.execute(&format!(
+            "INSERT INTO main.{} (id, thread_id, {}, identity_key, payload, created_at)
+             SELECT id, thread_id, {}, identity_key, payload, created_at FROM {source} WHERE {row_filter}",
+            quote_sql_identifier(target_table), quote_sql_identifier(target_type_column), quote_sql_identifier(source_type_column),
+        ), []).map_err(|e| e.to_string())?;
+    }
+    Ok(())
 }
 
 fn trim_export_database(snapshot: &Path, thread_ids: &[String], project_ids: &HashSet<String>) -> Result<(), String> {
@@ -659,8 +797,12 @@ fn trim_export_database(snapshot: &Path, thread_ids: &[String], project_ids: &Ha
             .map_err(|e| format!("无法裁剪子代理关系：{e}"))?;
         transaction.execute("DELETE FROM thread_dynamic_tools WHERE thread_id NOT IN (SELECT id FROM exported_thread_ids)", [])
             .map_err(|e| format!("无法裁剪会话工具配置：{e}"))?;
-        transaction.execute("DELETE FROM thread_artifacts WHERE thread_id NOT IN (SELECT id FROM exported_thread_ids)", [])
-            .map_err(|e| format!("无法裁剪会话产物配置：{e}"))?;
+        for (table, _) in THREAD_ATTACHMENT_TABLES {
+            if database_table_exists(&transaction, "main", table)? {
+                transaction.execute(&format!("DELETE FROM {} WHERE thread_id NOT IN (SELECT id FROM exported_thread_ids)", quote_sql_identifier(table)), [])
+                    .map_err(|e| format!("无法裁剪会话产物配置：{e}"))?;
+            }
+        }
         transaction.execute("DELETE FROM threads WHERE id NOT IN (SELECT id FROM exported_thread_ids)", [])
             .map_err(|e| format!("无法裁剪会话记录：{e}"))?;
         transaction.execute("DELETE FROM thread_sections WHERE id NOT IN (SELECT DISTINCT thread_section_id FROM threads WHERE thread_section_id IS NOT NULL)", [])
@@ -840,8 +982,8 @@ fn prepare_desktop_import_plan(
     Ok(DesktopImportPlan { state_path, state, projects: resolved })
 }
 
-fn write_desktop_import_state(
-    mut plan: DesktopImportPlan,
+fn update_desktop_import_state(
+    plan: &mut DesktopImportPlan,
     source_project_by_thread: &HashMap<String, Option<String>>,
 ) -> Result<usize, String> {
     let root = plan.state.as_object_mut().ok_or("Codex 侧栏状态格式无效。")?;
@@ -857,8 +999,6 @@ fn write_desktop_import_state(
         }));
         updated += 1;
     }
-    let content = serde_json::to_string(&plan.state).map_err(|e| format!("无法生成 Codex 侧栏状态：{e}"))?;
-    atomic_write(&plan.state_path, &content)?;
     Ok(updated)
 }
 
@@ -904,7 +1044,10 @@ fn effective_project_id(
 }
 
 fn report() -> Result<AuditReport, String> {
-    let home = codex_home()?;
+    report_at(&codex_home()?)
+}
+
+fn report_at(home: &Path) -> Result<AuditReport, String> {
     let db_path = state_database(&home)?;
     let conn = Connection::open_with_flags(&db_path, OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX)
         .map_err(|e| format!("无法打开 Codex 状态数据库：{e}"))?;
@@ -937,7 +1080,7 @@ fn report() -> Result<AuditReport, String> {
         let project = effective_project_id.as_ref().and_then(|id| project_lookup.get(id)).cloned();
         let matching_log = logs_by_id
             .get(&thread.id)
-            .and_then(|items| items.iter().find(|log| display_path(&log.path) == thread.rollout_path).or_else(|| items.first()));
+            .and_then(|items| items.iter().find(|log| same_file_path(&log.path, Path::new(&thread.rollout_path))).or_else(|| items.first()));
         let conversation_cwd = matching_log.and_then(|log| log.cwd.clone());
         let log_path = matching_log.map(|log| display_path(&log.path));
         let status = if conversation_cwd.is_none() {
@@ -1025,9 +1168,17 @@ fn backup_base(home: &Path, requested: Option<&str>) -> Result<PathBuf, String> 
 
 fn backup_folder(home: &Path, operation: &str, requested_base: Option<&str>) -> Result<PathBuf, String> {
     let stamp = Local::now().format("%Y%m%d-%H%M%S-%3f");
-    let path = backup_base(home, requested_base)?.join(format!("{stamp}-{operation}"));
-    fs::create_dir_all(&path).map_err(|e| format!("无法创建备份目录：{e}"))?;
-    Ok(path)
+    let base = backup_base(home, requested_base)?;
+    for attempt in 0..1000 {
+        let unique_stamp = if attempt == 0 { stamp.to_string() } else { format!("{stamp}{attempt}") };
+        let path = base.join(format!("{unique_stamp}-{operation}"));
+        match fs::create_dir(&path) {
+            Ok(()) => return Ok(path),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(format!("无法创建备份目录：{error}")),
+        }
+    }
+    Err("无法创建独立的备份目录，请稍后重试。".into())
 }
 
 fn backup_file(source: &Path, destination: &Path, name: &str) -> Result<(), String> {
@@ -1038,11 +1189,7 @@ fn backup_file(source: &Path, destination: &Path, name: &str) -> Result<(), Stri
 }
 
 fn backup_database(db_path: &Path, destination: &Path) -> Result<(), String> {
-    let source = Connection::open_with_flags(db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
-        .map_err(|e| format!("无法打开要备份的状态数据库：{e}"))?;
-    source
-        .backup(DatabaseName::Main, destination.join("state_5.sqlite"), None)
-        .map_err(|e| format!("创建一致性状态数据库备份失败：{e}"))
+    snapshot_database(db_path, &destination.join("state_5.sqlite"))
 }
 
 fn backup_entry(source: &Path, destination: &Path, name: &str) -> Result<Option<BackupFileEntry>, String> {
@@ -1182,6 +1329,8 @@ fn is_restorable_path(home: &Path, db_path: &Path, path: &Path) -> bool {
     path == db_path
         || path == PathBuf::from(format!("{}-wal", db_path.display()))
         || path == PathBuf::from(format!("{}-shm", db_path.display()))
+        || path == history_database(home)
+        || path == home.join(".codex-global-state.json")
         || is_managed_log(home, path)
 }
 
@@ -1371,39 +1520,6 @@ fn replace_file(source: &Path, destination: &Path) -> std::io::Result<()> {
     if succeeded == 0 { Err(std::io::Error::last_os_error()) } else { Ok(()) }
 }
 
-fn replace_path_values(value: &mut Value, previous_paths: &HashSet<String>, target: &str) -> usize {
-    match value {
-        Value::Array(items) => items.iter_mut().map(|item| replace_path_values(item, previous_paths, target)).sum(),
-        Value::Object(fields) => fields.iter_mut().map(|(key, item)| {
-            if key == "cwd" {
-                if let Value::String(text) = item {
-                    if previous_paths.contains(text) {
-                        *text = target.to_string();
-                        return 1;
-                    }
-                }
-            }
-            replace_path_values(item, previous_paths, target)
-        }).sum(),
-        _ => 0,
-    }
-}
-
-fn rewrite_log(path: &Path, previous_paths: &HashSet<String>, target: &str) -> Result<usize, String> {
-    let raw = fs::read_to_string(path).map_err(|e| format!("无法读取会话日志：{e}"))?;
-    let mut replacements = 0;
-    let mut lines = Vec::new();
-    for line in raw.lines() {
-        let mut value = serde_json::from_str::<Value>(line).map_err(|e| format!("会话日志不是有效 JSONL：{e}"))?;
-        replacements += replace_path_values(&mut value, previous_paths, target);
-        lines.push(serde_json::to_string(&value).map_err(|e| e.to_string())?);
-    }
-    if replacements > 0 {
-        atomic_write(path, &(lines.join("\n") + "\n"))?;
-    }
-    Ok(replacements)
-}
-
 fn is_codex_process(command: &str) -> bool {
     let command = command.trim().replace('\\', "/").to_lowercase();
     command.contains("/applications/chatgpt.app/contents/macos/chatgpt")
@@ -1486,10 +1602,14 @@ fn codex_executable_candidates() -> Vec<PathBuf> {
     #[cfg(target_os = "macos")]
     {
         candidates.extend([
+            PathBuf::from("/Applications/ChatGPT.app/Contents/Resources/codex-cli/bin/codex"),
+            PathBuf::from("/Applications/Codex.app/Contents/Resources/codex-cli/bin/codex"),
             PathBuf::from("/Applications/ChatGPT.app/Contents/Resources/codex"),
             PathBuf::from("/Applications/Codex.app/Contents/Resources/codex"),
         ]);
         if let Some(user_home) = platform_home_directory() {
+            candidates.push(user_home.join("Applications/ChatGPT.app/Contents/Resources/codex-cli/bin/codex"));
+            candidates.push(user_home.join("Applications/Codex.app/Contents/Resources/codex-cli/bin/codex"));
             candidates.push(user_home.join("Applications/ChatGPT.app/Contents/Resources/codex"));
             candidates.push(user_home.join("Applications/Codex.app/Contents/Resources/codex"));
         }
@@ -1499,6 +1619,10 @@ fn codex_executable_candidates() -> Vec<PathBuf> {
     {
         for base in [std::env::var_os("LOCALAPPDATA"), std::env::var_os("ProgramFiles")].into_iter().flatten() {
             let base = PathBuf::from(base);
+            candidates.push(base.join("Programs/ChatGPT/resources/codex-cli/bin/codex.exe"));
+            candidates.push(base.join("Programs/Codex/resources/codex-cli/bin/codex.exe"));
+            candidates.push(base.join("ChatGPT/resources/codex-cli/bin/codex.exe"));
+            candidates.push(base.join("Codex/resources/codex-cli/bin/codex.exe"));
             candidates.push(base.join("Programs/ChatGPT/resources/codex.exe"));
             candidates.push(base.join("Programs/Codex/resources/codex.exe"));
             candidates.push(base.join("ChatGPT/resources/codex.exe"));
@@ -1633,6 +1757,9 @@ fn inspect_export_package(manifest_path: String) -> Result<ImportPackageInfo, St
     let root = path.parent().ok_or("导出包路径无效。")?;
     let snapshot = root.join("state_5.sqlite");
     if !snapshot.is_file() { return Err("导出包缺少状态数据库快照。".into()); }
+    let history = package_history_path(root, &manifest)?;
+    let conn = Connection::open_with_flags(&snapshot, OpenFlags::SQLITE_OPEN_READ_ONLY).map_err(|e| e.to_string())?;
+    validate_history(&conn, "main", &history, &manifest.thread_ids)?;
     for log in &manifest.logs {
         if !manifest.thread_ids.iter().any(|id| id == &log.thread_id) { return Err("导出包日志归属无效。".into()); }
         let file = safe_package_file(root, &log.file)?;
@@ -1650,8 +1777,12 @@ fn inspect_export_package(manifest_path: String) -> Result<ImportPackageInfo, St
 
 #[tauri::command]
 fn export_sessions(request: ExportSessionsRequest) -> Result<ActionResult, String> {
+    ensure_codex_is_closed()?;
+    export_sessions_at(&codex_home()?, request)
+}
+
+fn export_sessions_at(home: &Path, request: ExportSessionsRequest) -> Result<ActionResult, String> {
     if request.thread_ids.is_empty() { return Err("请至少选择一个会话。".into()); }
-    let home = codex_home()?;
     let db_path = state_database(&home)?;
     let destination = PathBuf::from(request.destination_directory.trim());
     if !destination.is_absolute() || !destination.is_dir() { return Err("导出位置必须是一个已存在的绝对目录。".into()); }
@@ -1690,9 +1821,15 @@ fn export_sessions(request: ExportSessionsRequest) -> Result<ActionResult, Strin
         projects.push(ExportProject { id, name, roots });
     }
     projects.sort_by(|left, right| left.name.cmp(&right.name));
-    let logs = scan_logs(&home).into_iter().filter(|log| thread_ids.contains(&log.id)).collect::<Vec<_>>();
-    for visible_id in &request.thread_ids {
-        if !logs.iter().any(|log| &log.id == visible_id) { return Err(format!("会话 {visible_id} 缺少 JSONL 日志，无法创建完整导出包。")); }
+    // Two SQLite databases and JSONL files must describe the same stopped store.
+    validate_history(&conn, "main", &history_database(&home), &thread_ids)?;
+    let available_logs = scan_logs(&home);
+    let mut logs = Vec::new();
+    for id in &thread_ids {
+        let thread = threads_by_id.get(id).ok_or("导出会话信息不完整。")?;
+        let log = available_logs.iter().find(|log| log.id == *id && same_file_path(&log.path, Path::new(&thread.rollout_path)))
+            .ok_or_else(|| format!("会话 {id} 缺少当前数据库引用的 JSONL 日志，无法创建完整导出包。"))?;
+        logs.push(log.clone());
     }
     let stamp = Local::now().format("%Y%m%d-%H%M%S");
     let package = destination.join(format!("codex-session-export-{stamp}"));
@@ -1701,24 +1838,35 @@ fn export_sessions(request: ExportSessionsRequest) -> Result<ActionResult, Strin
     fs::create_dir(&logs_folder).map_err(|e| format!("无法创建导出日志目录：{e}"))?;
     backup_database(&db_path, &package)?;
     trim_export_database(&package.join("state_5.sqlite"), &thread_ids, &project_ids)?;
+    let history = snapshot_history(&home, &package, &thread_ids)?;
+    let history_conn = if history.is_some() { Some(Connection::open(package.join(HISTORY_FILE)).map_err(|e| e.to_string())?) } else { None };
     let mut exported_logs = Vec::new();
     for (index, log) in logs.iter().enumerate() {
         let name = format!("{index}-{}.jsonl", log.id);
-        fs::copy(&log.path, logs_folder.join(&name)).map_err(|e| format!("无法导出会话日志：{e}"))?;
-        exported_logs.push(ExportLog { thread_id: log.id.clone(), file: format!("logs/{name}"), archived: log.archived });
+        let exported = logs_folder.join(&name);
+        fs::copy(&log.path, &exported).map_err(|e| format!("无法导出会话日志：{e}"))?;
+        if let Some(history) = &history_conn {
+            let unchanged = prepare_log_rewrite(&exported, &HashSet::new(), "")?;
+            remap_history_offsets(history, "main", &log.id, &unchanged)?;
+        }
+        exported_logs.push(ExportLog { thread_id: log.id.clone(), file: format!("logs/{name}"), archived: log.archived, canonical: true });
     }
     let mut visible_thread_ids = request.thread_ids.clone();
     visible_thread_ids.sort();
     visible_thread_ids.dedup();
+    let exported_path_settings = desktop_state_update(&home)?.map(|desktop| thread_ids.iter()
+        .map(|id| (id.clone(), thread_path_settings(&desktop.state, id))).collect()).unwrap_or_default();
     let manifest = SessionExportManifest {
         format: "codex-session-manager-export".into(),
-        version: 1,
+        version: 2,
         exported_at: Local::now().to_rfc3339(),
         projects,
         visible_thread_ids,
         thread_ids,
         project_assignments,
         logs: exported_logs,
+        history_database: history.map(|entry| entry.backup_name),
+        thread_path_settings: exported_path_settings,
     };
     let manifest_path = package.join("manifest.json");
     fs::write(&manifest_path, serde_json::to_string_pretty(&manifest).map_err(|e| format!("无法生成导出清单：{e}"))?)
@@ -1736,6 +1884,11 @@ fn export_sessions(request: ExportSessionsRequest) -> Result<ActionResult, Strin
 
 #[tauri::command]
 fn import_sessions(request: ImportSessionsRequest) -> Result<ActionResult, String> {
+    ensure_codex_is_closed()?;
+    import_sessions_at(&codex_home()?, request)
+}
+
+fn import_sessions_at(home: &Path, request: ImportSessionsRequest) -> Result<ActionResult, String> {
     if request.confirmation != "IMPORT" { return Err("导入确认无效。".into()); }
     let manifest_path = fs::canonicalize(Path::new(request.manifest_path.trim())).map_err(|e| format!("无法读取导出包：{e}"))?;
     let manifest = read_export_manifest(&manifest_path)?;
@@ -1744,6 +1897,9 @@ fn import_sessions(request: ImportSessionsRequest) -> Result<ActionResult, Strin
     if !package_db.is_file() { return Err("导出包缺少状态数据库快照。".into()); }
     let package_conn = Connection::open_with_flags(&package_db, OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX)
         .map_err(|e| format!("无法打开导出包数据库：{e}"))?;
+    let package_history = package_history_path(package, &manifest)?;
+    validate_history(&package_conn, "main", &package_history, &manifest.thread_ids)?;
+    let paginated = paginated_threads(&package_conn, "main", &manifest.thread_ids)?;
     let mut source_project_by_thread = HashMap::new();
     let mut source_cwd_by_thread = HashMap::new();
     for id in &manifest.thread_ids {
@@ -1769,9 +1925,15 @@ fn import_sessions(request: ImportSessionsRequest) -> Result<ActionResult, Strin
     for visible_id in &manifest.visible_thread_ids {
         if !logs_by_thread.contains_key(visible_id) { return Err(format!("导出包中的主会话 {visible_id} 缺少日志。")); }
     }
-    ensure_codex_is_closed()?;
-    let home = codex_home()?;
-    let desktop_plan = prepare_desktop_import_plan(&home, &manifest.projects, &request.project_mappings)?;
+    let mut canonical_files = HashMap::new();
+    for id in &manifest.thread_ids {
+        let entries = manifest.logs.iter().filter(|log| log.thread_id == *id).collect::<Vec<_>>();
+        let marked = entries.iter().filter(|log| log.canonical).collect::<Vec<_>>();
+        let canonical = if marked.len() == 1 { Some(*marked[0]) } else if marked.is_empty() && entries.len() == 1 { Some(entries[0]) } else { None };
+        if let Some(log) = canonical { canonical_files.insert(id.clone(), safe_package_file(package, &log.file)?); }
+        else if paginated.contains(id) { return Err(format!("分页会话 {id} 缺少唯一的当前日志，已取消导入。")); }
+    }
+    let mut desktop_plan = prepare_desktop_import_plan(&home, &manifest.projects, &request.project_mappings)?;
     let resolved_projects = desktop_plan.projects.clone();
     for project_id in source_project_by_thread.values().flatten() {
         if !resolved_projects.contains_key(project_id) {
@@ -1780,6 +1942,9 @@ fn import_sessions(request: ImportSessionsRequest) -> Result<ActionResult, Strin
     }
     let db_path = state_database(&home)?;
     let mut conn = Connection::open(&db_path).map_err(|e| format!("无法打开 Codex 状态数据库：{e}"))?;
+    if !paginated.is_empty() && !database_table_columns(&conn, "main", "threads")?.iter().any(|column| column == "history_mode") {
+        return Err("当前 Codex 版本不支持分页历史，请升级 Codex 后再导入。".into());
+    }
     for id in &manifest.thread_ids {
         let existing: Option<String> = conn.query_row("SELECT id FROM threads WHERE id = ?1", params![id], |row| row.get(0)).optional()
             .map_err(|e| format!("无法检查现有会话：{e}"))?;
@@ -1790,21 +1955,30 @@ fn import_sessions(request: ImportSessionsRequest) -> Result<ActionResult, Strin
     fs::create_dir_all(&imported_logs_root).map_err(|e| format!("无法创建导入会话目录：{e}"))?;
     let mut rollout_paths: HashMap<String, String> = HashMap::new();
     let mut copied_logs = 0;
+    let mut rewrites = Vec::new();
+    let mut canonical_rewrites = HashMap::new();
+    let mut previous_paths_by_thread = HashMap::new();
     let copy_result = (|| -> Result<(), String> {
         for (thread_id, logs) in &logs_by_thread {
             for (index, (source, _)) in logs.iter().enumerate() {
                 let destination = imported_log_destination(&home, &batch, thread_id, index);
                 fs::copy(source, &destination).map_err(|e| format!("无法写入导入会话日志：{e}"))?;
+                let mut previous_paths = HashSet::new();
                 if let Some(project) = source_project_by_thread.get(thread_id).and_then(Option::as_ref).and_then(|id| resolved_projects.get(id)) {
-                    let mut previous_paths = HashSet::new();
                     if let Some(cwd) = source_cwd_by_thread.get(thread_id) { previous_paths.insert(cwd.clone()); }
                     if let Some(parsed) = parse_log(&destination, false).and_then(|log| log.cwd) { previous_paths.insert(parsed); }
                     if let Some(exported) = manifest.projects.iter().find(|item| item.id == project.source_project_id) {
                         previous_paths.extend(exported.roots.iter().cloned());
                     }
-                    rewrite_log(&destination, &previous_paths, &project.target_path)?;
                 }
-                rollout_paths.entry(thread_id.clone()).or_insert_with(|| display_path(&destination));
+                let target = source_project_by_thread.get(thread_id).and_then(Option::as_ref).and_then(|id| resolved_projects.get(id)).map(|project| project.target_path.as_str()).unwrap_or("");
+                let rewrite = prepare_log_rewrite(&destination, &previous_paths, target)?;
+                if canonical_files.get(thread_id) == Some(source) {
+                    canonical_rewrites.insert(thread_id.clone(), rewrites.len());
+                    rollout_paths.insert(thread_id.clone(), display_path(&destination));
+                } else { rollout_paths.entry(thread_id.clone()).or_insert_with(|| display_path(&destination)); }
+                previous_paths_by_thread.insert(thread_id.clone(), previous_paths);
+                rewrites.push(rewrite);
                 copied_logs += 1;
             }
         }
@@ -1814,7 +1988,31 @@ fn import_sessions(request: ImportSessionsRequest) -> Result<ActionResult, Strin
         let _ = fs::remove_dir_all(&imported_logs_root);
         return Err(error);
     }
+    let prepare_desktop = (|| -> Result<DesktopStateUpdate, String> {
+        for id in &manifest.thread_ids {
+            if let Some(settings) = manifest.thread_path_settings.get(id) {
+                let mut settings = settings.clone();
+                if let Some(project) = source_project_by_thread.get(id).and_then(Option::as_ref).and_then(|id| resolved_projects.get(id)) {
+                    for value in settings.values_mut() { remap_paths(value, previous_paths_by_thread.get(id).ok_or("导入会话缺少路径信息。")?, &project.target_path); }
+                }
+                validate_desktop_state(&desktop_plan.state)?;
+                restore_thread_settings(&mut desktop_plan.state, id, &settings);
+            }
+        }
+        update_desktop_import_state(&mut desktop_plan, &source_project_by_thread)?;
+        validate_desktop_state(&desktop_plan.state)?;
+        let path = desktop_plan.state_path.clone();
+        let existed = path.exists();
+        let original = if existed { fs::read_to_string(&path).map_err(|e| e.to_string())? } else { String::new() };
+        Ok(DesktopStateUpdate { path, original, existed, state: desktop_plan.state.clone() })
+    })();
+    let desktop = match prepare_desktop {
+        Ok(desktop) => desktop,
+        Err(error) => { let _ = fs::remove_dir_all(&imported_logs_root); return Err(error); }
+    };
+    let assignment_count = source_project_by_thread.values().flatten().count();
     let result = (|| -> Result<(), String> {
+        let has_history = attach_history(&conn, &home, Some(&package_history))?;
         conn.execute("ATTACH DATABASE ?1 AS imported_package", params![package_db.to_string_lossy().as_ref()])
             .map_err(|e| format!("无法连接导出包数据库：{e}"))?;
         conn.execute_batch("CREATE TEMP TABLE importing_thread_ids (id TEXT PRIMARY KEY); CREATE TEMP TABLE importing_project_ids (id TEXT PRIMARY KEY)")
@@ -1828,9 +2026,9 @@ fn import_sessions(request: ImportSessionsRequest) -> Result<ActionResult, Strin
                 .map_err(|e| format!("无法准备导入项目：{e}"))?;
         }
         let transaction = conn.transaction().map_err(|e| format!("无法开始导入：{e}"))?;
-        transaction.execute("INSERT OR IGNORE INTO projects SELECT * FROM imported_package.projects WHERE id IN (SELECT id FROM importing_project_ids)", [])
+        copy_database_rows(&transaction, "imported_package", "projects", "id IN (SELECT id FROM importing_project_ids)", true)
             .map_err(|e| format!("无法导入项目配置：{e}"))?;
-        transaction.execute("INSERT OR IGNORE INTO project_roots SELECT * FROM imported_package.project_roots WHERE project_id IN (SELECT id FROM importing_project_ids)", [])
+        copy_database_rows(&transaction, "imported_package", "project_roots", "project_id IN (SELECT id FROM importing_project_ids)", true)
             .map_err(|e| format!("无法导入项目目录配置：{e}"))?;
         for project in resolved_projects.values().filter(|project| project.app_server_project_id == project.source_project_id) {
             transaction.execute("DELETE FROM project_roots WHERE project_id = ?1", params![project.app_server_project_id])
@@ -1840,22 +2038,27 @@ fn import_sessions(request: ImportSessionsRequest) -> Result<ActionResult, Strin
                 params![project.app_server_project_id, project.target_path],
             ).map_err(|e| format!("无法写入导入项目目录：{e}"))?;
         }
-        transaction.execute("INSERT OR IGNORE INTO thread_sections SELECT * FROM imported_package.thread_sections WHERE id IN (SELECT DISTINCT thread_section_id FROM imported_package.threads WHERE id IN (SELECT id FROM importing_thread_ids) AND thread_section_id IS NOT NULL)", [])
+        copy_database_rows(&transaction, "imported_package", "thread_sections", "id IN (SELECT DISTINCT thread_section_id FROM imported_package.threads WHERE id IN (SELECT id FROM importing_thread_ids) AND thread_section_id IS NOT NULL)", true)
             .map_err(|e| format!("无法导入会话分组配置：{e}"))?;
-        transaction.execute("INSERT INTO threads SELECT * FROM imported_package.threads WHERE id IN (SELECT id FROM importing_thread_ids)", [])
+        copy_database_rows(&transaction, "imported_package", "threads", "id IN (SELECT id FROM importing_thread_ids)", false)
             .map_err(|e| format!("无法导入会话记录：{e}"))?;
-        transaction.execute("INSERT INTO thread_dynamic_tools SELECT * FROM imported_package.thread_dynamic_tools WHERE thread_id IN (SELECT id FROM importing_thread_ids)", [])
+        copy_database_rows(&transaction, "imported_package", "thread_dynamic_tools", "thread_id IN (SELECT id FROM importing_thread_ids)", false)
             .map_err(|e| format!("无法导入会话工具配置：{e}"))?;
-        transaction.execute("INSERT INTO thread_artifacts SELECT * FROM imported_package.thread_artifacts WHERE thread_id IN (SELECT id FROM importing_thread_ids)", [])
+        copy_thread_attachments(&transaction, "imported_package", "importing_thread_ids")
             .map_err(|e| format!("无法导入会话产物配置：{e}"))?;
-        transaction.execute("INSERT OR IGNORE INTO thread_spawn_edges SELECT * FROM imported_package.thread_spawn_edges WHERE child_thread_id IN (SELECT id FROM importing_thread_ids)", [])
+        copy_database_rows(&transaction, "imported_package", "thread_spawn_edges", "child_thread_id IN (SELECT id FROM importing_thread_ids)", true)
             .map_err(|e| format!("无法导入子代理关系：{e}"))?;
+        if has_history && package_history.is_file() {
+            copy_history(&transaction, "importing_thread_ids")?;
+            for (id, index) in &canonical_rewrites { remap_history_offsets(&transaction, "thread_history", id, &rewrites[*index])?; }
+        }
         for (thread_id, rollout_path) in &rollout_paths {
             transaction.execute("UPDATE threads SET rollout_path = ?1 WHERE id = ?2", params![rollout_path, thread_id])
                 .map_err(|e| format!("无法更新导入会话日志位置：{e}"))?;
         }
         for (thread_id, source_project_id) in &source_project_by_thread {
             if let Some(project) = source_project_id.as_ref().and_then(|id| resolved_projects.get(id)) {
+                update_thread_path(&transaction, thread_id, previous_paths_by_thread.get(thread_id).ok_or("导入会话缺少路径信息。")?, &project.target_path, None)?;
                 transaction.execute(
                     "UPDATE threads SET project_id = ?1, cwd = ?2 WHERE id = ?3",
                     params![project.app_server_project_id, project.target_path, thread_id],
@@ -1873,7 +2076,7 @@ fn import_sessions(request: ImportSessionsRequest) -> Result<ActionResult, Strin
                 params![project.source_project_id],
             ).map_err(|e| format!("无法清理源电脑的空项目配置：{e}"))?;
         }
-        transaction.commit().map_err(|e| format!("无法提交导入：{e}"))?;
+        commit_with_logs(transaction, &rewrites, Some(&desktop)).map_err(|e| format!("无法提交导入：{e}"))?;
         conn.execute_batch("DETACH DATABASE imported_package").ok();
         Ok(())
     })();
@@ -1881,8 +2084,6 @@ fn import_sessions(request: ImportSessionsRequest) -> Result<ActionResult, Strin
         let _ = fs::remove_dir_all(&imported_logs_root);
         return Err(error);
     }
-    let assignment_count = write_desktop_import_state(desktop_plan, &source_project_by_thread)
-        .map_err(|e| format!("会话已导入，但无法更新 Codex 侧栏归属：{e}"))?;
     Ok(ActionResult {
         message: "已导入会话及项目配置，并将工作目录转换为这台电脑上的项目目录。请重新打开 Codex，导入的会话会显示在对应项目中。".into(),
         backup_folder: String::new(),
@@ -1997,11 +2198,14 @@ fn close_codex_processes() -> Result<ProcessCloseResult, String> {
 
 #[tauri::command]
 fn repair_session(request: RepairRequest) -> Result<ActionResult, String> {
+    ensure_codex_is_closed()?;
+    repair_session_at(&codex_home()?, request)
+}
+
+fn repair_session_at(home: &Path, request: RepairRequest) -> Result<ActionResult, String> {
     if request.confirmation != "REPAIR" { return Err("请在确认框输入 REPAIR。".into()); }
     let target = PathBuf::from(request.target_path.trim());
     if !target.is_absolute() || !target.is_dir() { return Err("修复目标必须是一个已存在的绝对目录。".into()); }
-    ensure_codex_is_closed()?;
-    let home = codex_home()?;
     let db_path = state_database(&home)?;
     let mut conn = Connection::open(&db_path).map_err(|e| format!("无法打开状态数据库：{e}"))?;
     let mut logs_by_id: HashMap<String, Vec<LogMeta>> = HashMap::new();
@@ -2010,15 +2214,15 @@ fn repair_session(request: RepairRequest) -> Result<ActionResult, String> {
     }
     let targets = load_repair_targets(&conn, &request.thread_id, request.include_child_agents, &logs_by_id)?;
     let root = targets.first().ok_or("未找到目标会话。")?;
+    let ids = targets.iter().map(|target| target.id.clone()).collect::<Vec<_>>();
+    validate_history(&conn, "main", &history_database(&home), &ids)?;
+    let has_history = attach_history(&conn, &home, None)?;
+    let mut desktop = desktop_state_update(&home)?;
     let backup = backup_folder(&home, "repair", request.backup_base.as_deref())?;
-    let mut backup_files = Vec::new();
-    if let Some(entry) = backup_entry(&db_path, &backup, "state_5.sqlite")? { backup_files.push(entry); }
-    for suffix in ["-wal", "-shm"] {
-        let auxiliary = PathBuf::from(format!("{}{}", db_path.display(), suffix));
-        if let Some(name) = auxiliary.file_name().and_then(|part| part.to_str()) {
-            if let Some(entry) = backup_entry(&auxiliary, &backup, name)? { backup_files.push(entry); }
-        }
-    }
+    backup_database(&db_path, &backup)?;
+    let mut backup_files = vec![BackupFileEntry { original_path: display_path(&db_path), backup_name: "state_5.sqlite".into() }];
+    if let Some(entry) = snapshot_history(&home, &backup, &ids)? { backup_files.push(entry); }
+    if let Some(entry) = backup_entry(&home.join(".codex-global-state.json"), &backup, "codex-global-state.json")? { backup_files.push(entry); }
     let mut log_index = 0;
     for target in &targets {
         for log in &target.logs {
@@ -2031,6 +2235,9 @@ fn repair_session(request: RepairRequest) -> Result<ActionResult, String> {
     let mut replacements = 0;
     let mut changes = Vec::new();
     let mut thread_changes = Vec::new();
+    let mut rewrites = Vec::new();
+    let mut canonical_rewrites = HashMap::new();
+    let mut previous_paths_by_thread = HashMap::new();
     for repair_target in &targets {
         let mut old_paths = HashSet::from([repair_target.cwd.clone()]);
         for log in &repair_target.logs {
@@ -2039,41 +2246,56 @@ fn repair_session(request: RepairRequest) -> Result<ActionResult, String> {
         let label = if repair_target.id == request.thread_id { "主会话" } else { "子代理" };
         changes.push(format!("{label}数据库工作目录（{}）：{} → {}", repair_target.title, repair_target.cwd, target_text));
         for log in &repair_target.logs {
-            let replaced = rewrite_log(&log.path, &old_paths, &target_text)?;
-            replacements += replaced;
+            let rewrite = prepare_log_rewrite(&log.path, &old_paths, &target_text)?;
+            replacements += rewrite.replacements;
+            if same_file_path(&log.path, Path::new(&repair_target.rollout_path)) { canonical_rewrites.insert(repair_target.id.clone(), rewrites.len()); }
+            rewrites.push(rewrite);
             let name = log.path.file_name().unwrap_or_default().to_string_lossy();
             if let Some(cwd) = &log.cwd {
                 changes.push(format!("{label}对话工作目录（{name}）：{cwd} → {target_text}"));
             }
         }
+        let desktop_path_settings = desktop.as_ref().map(|desktop| thread_path_settings(&desktop.state, &repair_target.id)).unwrap_or_default();
+        if let Some(desktop) = &mut desktop {
+            let mut updated = desktop_path_settings.clone();
+            for value in updated.values_mut() { remap_paths(value, &old_paths, &target_text); }
+            restore_thread_settings(&mut desktop.state, &repair_target.id, &updated);
+        }
+        let sandbox_policy = conn.query_row("SELECT sandbox_policy FROM threads WHERE id = ?1", params![repair_target.id], |row| row.get::<_, String>(0)).map_err(|e| e.to_string())?;
+        previous_paths_by_thread.insert(repair_target.id.clone(), old_paths);
         thread_changes.push(ThreadRepairChange {
             thread_id: repair_target.id.clone(),
             session_title: repair_target.title.clone(),
             source_cwd: repair_target.cwd.clone(),
             target_cwd: target_text.clone(),
+            sandbox_policy: Some(sandbox_policy),
+            desktop_path_settings,
         });
     }
-    let transaction = conn.transaction().map_err(|e| format!("无法开始会话路径更新：{e}"))?;
-    for repair_target in &targets {
-        transaction.execute("UPDATE threads SET cwd = ?1 WHERE id = ?2", params![target_text, repair_target.id])
-            .map_err(|e| format!("更新 Codex 会话路径失败（备份位于 {}）：{e}", backup.display()))?;
-    }
-    transaction.commit().map_err(|e| format!("无法提交会话路径更新：{e}"))?;
     let manifest = RepairManifest {
-        version: 2,
+        version: 3,
         created_at: Local::now().to_rfc3339(),
         thread_id: request.thread_id,
         session_title: root.title.clone(),
         source_cwd: root.cwd.clone(),
-        target_cwd: target_text,
+        target_cwd: target_text.clone(),
         files: backup_files,
         thread_changes,
         rolled_back_at: None,
     };
     write_manifest(&backup, &manifest)?;
+    let transaction = conn.transaction().map_err(|e| format!("无法开始会话路径更新：{e}"))?;
+    for repair_target in &targets {
+        update_thread_path(&transaction, &repair_target.id, &previous_paths_by_thread[&repair_target.id], &target_text, None)
+            .map_err(|e| format!("更新会话路径失败（备份位于 {}）：{e}", backup.display()))?;
+        if has_history {
+            remap_history_offsets(&transaction, "thread_history", &repair_target.id, &rewrites[canonical_rewrites[&repair_target.id]])?;
+        }
+    }
+    commit_with_logs(transaction, &rewrites, desktop.as_ref()).map_err(|e| format!("无法提交路径修复（备份位于 {}）：{e}", backup.display()))?;
     let child_count = targets.len().saturating_sub(1);
     let scope = if child_count == 0 { "主会话".to_string() } else { format!("主会话及 {child_count} 个子代理") };
-    Ok(ActionResult { message: format!("已修复{scope}的路径，并更新日志中的 {replacements} 处工作目录字段。请重启 Codex 后复查。"), backup_folder: display_path(&backup), changes })
+    Ok(ActionResult { message: format!("已修复{scope}的路径，更新日志中的 {replacements} 处目录和权限字段，并同步分页历史索引。请重启 Codex 后复查。"), backup_folder: display_path(&backup), changes })
 }
 
 #[tauri::command]
@@ -2089,17 +2311,28 @@ fn repair_project(request: ProjectRepairRequest) -> Result<ActionResult, String>
     let (project_name, thread_ids) = project_sidebar_threads(&home, &conn, &request.project_id)?;
     let logs_by_id = scan_logs(&home).into_iter().map(|log| log.id).collect::<HashSet<_>>();
     let mut repairable = Vec::new();
+    let mut repair_scope = HashSet::new();
     let mut skipped = 0;
     for thread_id in &thread_ids {
         let mut scope = vec![thread_id.clone()];
         scope.extend(descendant_thread_ids(&conn, thread_id)?);
-        if scope.iter().all(|id| logs_by_id.contains(id)) { repairable.push(thread_id.clone()); } else { skipped += 1; }
+        if scope.iter().all(|id| logs_by_id.contains(id)) {
+            repair_scope.extend(scope);
+            repairable.push(thread_id.clone());
+        } else { skipped += 1; }
     }
+    let scoped_ids = repair_scope.iter().cloned().collect::<Vec<_>>();
+    validate_history(&conn, "main", &history_database(&home), &scoped_ids)?;
     drop(conn);
 
     let safety = backup_folder(&home, "repair-project", request.backup_base.as_deref())?;
     backup_database(&db_path, &safety)?;
+    snapshot_history(&home, &safety, &scoped_ids)?;
     let _ = backup_entry(&home.join(".codex-global-state.json"), &safety, "codex-global-state.json")?;
+    for (index, log) in scan_logs(&home).into_iter().filter(|log| repair_scope.contains(&log.id)).enumerate() {
+        let name = format!("{index}-{}", log.path.file_name().unwrap_or_default().to_string_lossy());
+        backup_file(&log.path, &safety, &name)?;
+    }
     let mut completed = 0;
     for thread_id in &repairable {
         repair_session(RepairRequest {
@@ -2136,14 +2369,17 @@ fn repair_project(request: ProjectRepairRequest) -> Result<ActionResult, String>
 
 #[tauri::command]
 fn rollback_repair(request: RollbackRequest) -> Result<ActionResult, String> {
-    if request.confirmation != "ROLLBACK" { return Err("回退确认无效。".into()); }
     ensure_codex_is_closed()?;
-    let home = codex_home()?;
+    rollback_repair_at(&codex_home()?, request)
+}
+
+fn rollback_repair_at(home: &Path, request: RollbackRequest) -> Result<ActionResult, String> {
+    if request.confirmation != "ROLLBACK" { return Err("回退确认无效。".into()); }
     let db_path = state_database(&home)?;
     let base = backup_base(&home, request.backup_base.as_deref())?;
     let manifest_path = validate_manifest_path(&base, Path::new(&request.manifest_path))?;
     let mut manifest = read_manifest(&manifest_path)?;
-    if !(1..=2).contains(&manifest.version) || manifest.files.is_empty() { return Err("该修复历史不支持回退。".into()); }
+    if !(1..=3).contains(&manifest.version) || manifest.files.is_empty() { return Err("该修复历史不支持回退。".into()); }
     let folder = manifest_path.parent().ok_or("修复历史目录无效")?;
     for entry in &manifest.files {
         let original = PathBuf::from(&entry.original_path);
@@ -2159,6 +2395,8 @@ fn rollback_repair(request: RollbackRequest) -> Result<ActionResult, String> {
             session_title: manifest.session_title.clone(),
             source_cwd: manifest.source_cwd.clone(),
             target_cwd: manifest.target_cwd.clone(),
+            sandbox_policy: None,
+            desktop_path_settings: HashMap::new(),
         }]
     } else {
         manifest.thread_changes.clone()
@@ -2175,27 +2413,42 @@ fn rollback_repair(request: RollbackRequest) -> Result<ActionResult, String> {
 
     let safety = backup_folder(&home, "before-rollback", request.backup_base.as_deref())?;
     backup_database(&db_path, &safety)?;
+    let ids = thread_changes.iter().map(|change| change.thread_id.clone()).collect::<Vec<_>>();
+    snapshot_history(&home, &safety, &ids)?;
+    backup_entry(&home.join(".codex-global-state.json"), &safety, "codex-global-state.json")?;
     for (index, log) in current_logs.iter().enumerate() {
         let name = format!("current-{index}-{}", log.path.file_name().unwrap_or_default().to_string_lossy());
         backup_file(&log.path, &safety, &name)?;
     }
 
     let mut conn = Connection::open(&db_path).map_err(|e| format!("无法打开状态数据库：{e}"))?;
+    validate_history(&conn, "main", &history_database(&home), &ids)?;
+    let has_history = attach_history(&conn, &home, None)?;
+    let mut desktop = desktop_state_update(&home)?;
+    let mut rewrites = Vec::new();
+    let mut canonical_rewrites = HashMap::new();
+    for log in &current_logs {
+        let change = &change_by_id[&log.id];
+        let baseline = manifest.files.iter().find(|entry| same_file_path(Path::new(&entry.original_path), &log.path))
+            .map(|entry| folder.join(&entry.backup_name));
+        let rewrite = prepare_log_rollback(&log.path, baseline.as_deref(), &change.target_cwd, &change.source_cwd)?;
+        let canonical: String = conn.query_row("SELECT rollout_path FROM threads WHERE id = ?1", params![log.id], |row| row.get(0)).map_err(|e| e.to_string())?;
+        if same_file_path(&log.path, Path::new(&canonical)) { canonical_rewrites.insert(log.id.clone(), rewrites.len()); }
+        rewrites.push(rewrite);
+    }
+    if let Some(desktop) = &mut desktop {
+        for change in &thread_changes { restore_thread_settings(&mut desktop.state, &change.thread_id, &change.desktop_path_settings); }
+    }
     let transaction = conn.transaction().map_err(|e| format!("无法开始回退：{e}"))?;
     for change in &thread_changes {
-        let updated = transaction.execute(
-            "UPDATE threads SET cwd = ?1 WHERE id = ?2",
-            params![&change.source_cwd, &change.thread_id],
-        ).map_err(|e| format!("回退数据库工作目录失败（回退前备份位于 {}）：{e}", safety.display()))?;
-        if updated != 1 { return Err(format!("数据库中已找不到会话“{}”，已停止回退。", change.session_title)); }
+        update_thread_path(&transaction, &change.thread_id, &HashSet::from([change.target_cwd.clone()]), &change.source_cwd, change.sandbox_policy.as_deref())?;
+        if has_history {
+            let index = canonical_rewrites.get(&change.thread_id).ok_or("找不到当前数据库引用的日志，已停止回退。")?;
+            remap_history_offsets(&transaction, "thread_history", &change.thread_id, &rewrites[*index])?;
+        }
     }
-    transaction.commit().map_err(|e| format!("无法提交回退：{e}"))?;
-
-    let mut replacements = 0;
-    for log in &current_logs {
-        let change = change_by_id.get(&log.id).ok_or("回退会话信息不完整。")?;
-        replacements += rewrite_log(&log.path, &HashSet::from([change.target_cwd.clone()]), &change.source_cwd)?;
-    }
+    let replacements = rewrites.iter().map(|rewrite| rewrite.replacements).sum::<usize>();
+    commit_with_logs(transaction, &rewrites, desktop.as_ref()).map_err(|e| format!("无法提交回退（回退前备份位于 {}）：{e}", safety.display()))?;
     manifest.rolled_back_at = Some(Local::now().to_rfc3339());
     write_manifest(folder, &manifest)?;
     Ok(ActionResult {
@@ -2211,9 +2464,12 @@ fn rollback_repair(request: RollbackRequest) -> Result<ActionResult, String> {
 
 #[tauri::command]
 fn rollback_delete(request: DeleteRollbackRequest) -> Result<ActionResult, String> {
-    if request.confirmation != "RESTORE_DELETION" { return Err("删除回退确认无效。".into()); }
     ensure_codex_is_closed()?;
-    let home = codex_home()?;
+    rollback_delete_at(&codex_home()?, request)
+}
+
+fn rollback_delete_at(home: &Path, request: DeleteRollbackRequest) -> Result<ActionResult, String> {
+    if request.confirmation != "RESTORE_DELETION" { return Err("删除回退确认无效。".into()); }
     let db_path = state_database(&home)?;
     let base = backup_base(&home, request.backup_base.as_deref())?;
     let manifest_path = validate_delete_manifest_path(&base, Path::new(&request.manifest_path))?;
@@ -2262,26 +2518,67 @@ fn rollback_delete(request: DeleteRollbackRequest) -> Result<ActionResult, Strin
         conn.execute("INSERT INTO restored_thread_ids (id) VALUES (?1)", params![id])
             .map_err(|e| format!("无法准备恢复会话：{e}"))?;
     }
+    let snapshot_history = folder.join(HISTORY_FILE);
+    validate_history(&conn, "deleted_backup", &snapshot_history, &ids)?;
+    if !paginated_threads(&conn, "deleted_backup", &ids)?.is_empty() && !database_table_columns(&conn, "main", "threads")?.iter().any(|column| column == "history_mode") {
+        return Err("当前 Codex 不支持备份中的分页历史，请升级 Codex 后恢复。".into());
+    }
+    compatibility::snapshot_history(&home, &safety, &ids)?;
+    let has_history = attach_history(&conn, &home, Some(&snapshot_history))?;
+    backup_entry(&home.join(".codex-global-state.json"), &safety, "codex-global-state.json")?;
+    let mut desktop = desktop_state_update(&home)?;
+    let backup_state_path = folder.join("codex-global-state.json");
+    let backup_state: Value = if backup_state_path.is_file() {
+        serde_json::from_str(&fs::read_to_string(&backup_state_path).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?
+    } else { serde_json::json!({}) };
+    conn.execute_batch("CREATE TEMP TABLE restored_project_ids (id TEXT PRIMARY KEY); INSERT OR IGNORE INTO restored_project_ids SELECT project_id FROM deleted_backup.threads WHERE id IN (SELECT id FROM restored_thread_ids) AND project_id IS NOT NULL")
+        .map_err(|e| e.to_string())?;
+    let mut restored_projects = HashSet::new();
+    for id in &ids {
+        if let Some(project) = desktop_project_for_thread(&backup_state, id) {
+            conn.execute("INSERT OR IGNORE INTO restored_project_ids VALUES (?1)", params![project]).map_err(|e| e.to_string())?;
+            restored_projects.insert(project);
+        }
+    }
+    if let Some(desktop) = &mut desktop {
+        restore_desktop_projects(&mut desktop.state, &backup_state, &restored_projects);
+        for id in &ids {
+            restore_thread_settings(&mut desktop.state, id, &thread_path_settings(&backup_state, id));
+            if let Some(assignment) = backup_state.get("thread-project-assignments").and_then(|assignments| assignments.get(id)) {
+                if desktop.state.get("thread-project-assignments").is_none() { desktop.state["thread-project-assignments"] = serde_json::json!({}); }
+                desktop.state["thread-project-assignments"][id] = assignment.clone();
+            }
+        }
+    }
     let log_entries = manifest.files.iter().filter(|entry| is_managed_log(&home, Path::new(&entry.original_path))).cloned().collect::<Vec<_>>();
+    let mut rewrites = Vec::new();
     for entry in &log_entries {
         let source = folder.join(&entry.backup_name);
         if !source.is_file() { return Err(format!("删除备份缺少日志：{}", entry.backup_name)); }
         let original = PathBuf::from(&entry.original_path);
         if original.exists() { backup_file(&original, &safety, &format!("current-{}", entry.backup_name))?; }
+        fs::create_dir_all(original.parent().ok_or("日志路径无效")?).map_err(|e| e.to_string())?;
+        rewrites.push(prepare_log_restore(&source, &original)?);
     }
     {
         let transaction = conn.transaction().map_err(|e| format!("无法开始删除回退：{e}"))?;
-        transaction.execute("INSERT INTO threads SELECT * FROM deleted_backup.threads WHERE id IN (SELECT id FROM restored_thread_ids)", [])
+        copy_database_rows(&transaction, "deleted_backup", "projects", "id IN (SELECT id FROM restored_project_ids)", true)?;
+        copy_database_rows(&transaction, "deleted_backup", "project_roots", "project_id IN (SELECT id FROM restored_project_ids)", true)?;
+        copy_database_rows(&transaction, "deleted_backup", "thread_sections", "id IN (SELECT thread_section_id FROM deleted_backup.threads WHERE id IN (SELECT id FROM restored_thread_ids))", true)?;
+        copy_database_rows(&transaction, "deleted_backup", "threads", "id IN (SELECT id FROM restored_thread_ids)", false)
             .map_err(|e| format!("恢复会话记录失败：{e}"))?;
-        transaction.execute("INSERT INTO thread_dynamic_tools SELECT * FROM deleted_backup.thread_dynamic_tools WHERE thread_id IN (SELECT id FROM restored_thread_ids)", []).map_err(|e| format!("恢复会话工具失败：{e}"))?;
-        transaction.execute("INSERT INTO thread_artifacts SELECT * FROM deleted_backup.thread_artifacts WHERE thread_id IN (SELECT id FROM restored_thread_ids)", []).map_err(|e| format!("恢复会话产物失败：{e}"))?;
-        transaction.execute("INSERT OR IGNORE INTO thread_spawn_edges SELECT * FROM deleted_backup.thread_spawn_edges WHERE child_thread_id IN (SELECT id FROM restored_thread_ids)", []).map_err(|e| format!("恢复会话关系失败：{e}"))?;
-        transaction.commit().map_err(|e| format!("无法提交删除回退：{e}"))?;
-    }
-    for entry in &log_entries {
-        let original = PathBuf::from(&entry.original_path);
-        fs::create_dir_all(original.parent().ok_or("日志路径无效")?).map_err(|e| format!("无法创建日志目录：{e}"))?;
-        fs::copy(folder.join(&entry.backup_name), &original).map_err(|e| format!("恢复会话日志失败：{e}"))?;
+        copy_database_rows(&transaction, "deleted_backup", "thread_dynamic_tools", "thread_id IN (SELECT id FROM restored_thread_ids)", false).map_err(|e| format!("恢复会话工具失败：{e}"))?;
+        copy_thread_attachments(&transaction, "deleted_backup", "restored_thread_ids").map_err(|e| format!("恢复会话产物失败：{e}"))?;
+        copy_database_rows(&transaction, "deleted_backup", "thread_spawn_edges", "child_thread_id IN (SELECT id FROM restored_thread_ids)", true).map_err(|e| format!("恢复会话关系失败：{e}"))?;
+        if has_history && snapshot_history.is_file() {
+            copy_history(&transaction, "restored_thread_ids")?;
+        }
+        for id in &ids {
+            let rollout: String = transaction.query_row("SELECT rollout_path FROM threads WHERE id = ?1", params![id], |row| row.get(0)).map_err(|e| e.to_string())?;
+            let rewrite = rewrites.iter().find(|rewrite| same_file_path(&rewrite.path, Path::new(&rollout))).ok_or_else(|| format!("删除备份缺少会话 {id} 的当前日志，已取消恢复。"))?;
+            if has_history { remap_history_offsets(&transaction, "thread_history", id, rewrite)?; }
+        }
+        commit_with_logs(transaction, &rewrites, desktop.as_ref()).map_err(|e| format!("无法提交删除回退：{e}"))?;
     }
     conn.execute_batch("DETACH DATABASE deleted_backup").ok();
     manifest.rolled_back_at = Some(Local::now().to_rfc3339());
@@ -2296,7 +2593,11 @@ fn delete_session(request: DeleteSessionRequest) -> Result<ActionResult, String>
     // app-server process while it is open leaves a stale row that cannot be
     // restored, even though the database deletion succeeded.
     ensure_codex_is_closed()?;
-    let home = codex_home()?;
+    delete_session_at(&codex_home()?, request)
+}
+
+fn delete_session_at(home: &Path, request: DeleteSessionRequest) -> Result<ActionResult, String> {
+    if request.confirmation != "DELETE" { return Err("请在确认框输入 DELETE。".into()); }
     let db_path = state_database(&home)?;
     let conn = Connection::open_with_flags(&db_path, OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX)
         .map_err(|e| format!("无法打开 Codex 状态数据库：{e}"))?;
@@ -2309,6 +2610,8 @@ fn delete_session(request: DeleteSessionRequest) -> Result<ActionResult, String>
 
     let mut thread_ids = HashSet::from([request.thread_id.clone()]);
     thread_ids.extend(descendant_thread_ids(&conn, &request.thread_id)?);
+    let scoped_ids = thread_ids.iter().cloned().collect::<Vec<_>>();
+    validate_history(&conn, "main", &history_database(&home), &scoped_ids)?;
     drop(conn);
 
     let backup = backup_folder(&home, "deleted-session", request.backup_base.as_deref())?;
@@ -2324,6 +2627,7 @@ fn delete_session(request: DeleteSessionRequest) -> Result<ActionResult, String>
         original_path: display_path(&db_path),
         backup_name: "state_5.sqlite".into(),
     }];
+    if let Some(entry) = snapshot_history(&home, &backup, &scoped_ids)? { backup_files.push(entry); }
     if let Some(entry) = backup_entry(&home.join(".codex-global-state.json"), &backup, "codex-global-state.json")? {
         backup_files.push(entry);
     }
@@ -2341,7 +2645,7 @@ fn delete_session(request: DeleteSessionRequest) -> Result<ActionResult, String>
 
     let child_count = thread_ids.len().saturating_sub(1);
     let mut manifest = DeleteManifest {
-        version: 1,
+        version: 2,
         created_at: Local::now().to_rfc3339(),
         completed_at: None,
         deletion_kind: "session".into(),
@@ -2392,6 +2696,7 @@ fn delete_project(request: ProjectDeleteRequest) -> Result<ActionResult, String>
 
     let safety = backup_folder(&home, "before-project-delete", request.backup_base.as_deref())?;
     backup_database(&db_path, &safety)?;
+    snapshot_history(&home, &safety, &all_thread_ids.iter().cloned().collect::<Vec<_>>())?;
     let _ = backup_entry(&home.join(".codex-global-state.json"), &safety, "codex-global-state.json")?;
     let _ = backup_entry(&desktop_catalog_database(&home), &safety, "codex-dev.db")?;
     for (index, log) in scan_logs(&home).into_iter().filter(|log| all_thread_ids.contains(&log.id)).enumerate() {
@@ -2614,6 +2919,220 @@ pub fn run() {
 mod tests {
     use super::*;
 
+    struct TemporaryDatabase {
+        folder: PathBuf,
+        path: PathBuf,
+    }
+
+    impl TemporaryDatabase {
+        fn new() -> Self {
+            static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let serial = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let folder = std::env::temp_dir().join(format!(
+                "codex-session-manager-schema-test-{}-{}-{serial}",
+                std::process::id(), Local::now().timestamp_nanos_opt().unwrap_or_default()
+            ));
+            fs::create_dir(&folder).unwrap();
+            let path = folder.join("state_5.sqlite");
+            Self { folder, path }
+        }
+    }
+
+    impl Drop for TemporaryDatabase {
+        fn drop(&mut self) { let _ = fs::remove_dir_all(&self.folder); }
+    }
+
+    fn create_attachment_table(conn: &Connection, schema: &str, table: &str, type_column: &str) {
+        conn.execute_batch(&format!(
+            "CREATE TABLE {schema}.{table} (
+                id TEXT PRIMARY KEY,
+                thread_id TEXT NOT NULL REFERENCES threads(id) ON DELETE CASCADE,
+                {type_column} TEXT NOT NULL,
+                identity_key TEXT NOT NULL,
+                payload TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                UNIQUE (thread_id, {type_column}, identity_key)
+            );"
+        )).unwrap();
+    }
+
+    #[test]
+    fn trims_export_attachments_for_current_legacy_and_absent_tables() {
+        for tables in [
+            vec![("thread_artifacts", "artifact_type")],
+            vec![("thread_attachments", "attachment_type")],
+            THREAD_ATTACHMENT_TABLES.to_vec(),
+            vec![],
+        ] {
+            let database = TemporaryDatabase::new();
+            let conn = Connection::open(&database.path).unwrap();
+            conn.execute_batch(
+                "PRAGMA foreign_keys = ON;
+                 CREATE TABLE projects (id TEXT PRIMARY KEY);
+                 CREATE TABLE project_roots (project_id TEXT, path TEXT);
+                 CREATE TABLE thread_sections (id TEXT PRIMARY KEY);
+                 CREATE TABLE threads (id TEXT PRIMARY KEY, project_id TEXT, thread_section_id TEXT);
+                 CREATE TABLE thread_dynamic_tools (thread_id TEXT, name TEXT);
+                 CREATE TABLE thread_spawn_edges (parent_thread_id TEXT, child_thread_id TEXT);
+                 CREATE TABLE _sqlx_migrations (version INTEGER);
+                 INSERT INTO projects VALUES ('kept-project'), ('other-project');
+                 INSERT INTO project_roots VALUES ('kept-project', '/kept'), ('other-project', '/other');
+                 INSERT INTO thread_sections VALUES ('kept-section'), ('other-section');
+                 INSERT INTO threads VALUES ('kept', 'kept-project', 'kept-section'), ('other', 'other-project', 'other-section');
+                 INSERT INTO thread_dynamic_tools VALUES ('kept', 'kept-tool'), ('other', 'other-tool');
+                 INSERT INTO thread_spawn_edges VALUES ('kept', 'other');"
+            ).unwrap();
+            for (table, type_column) in &tables {
+                create_attachment_table(&conn, "main", table, type_column);
+                conn.execute_batch(&format!(
+                    "INSERT INTO {table} VALUES
+                        ('kept-{table}', 'kept', 'pull_request', 'kept-key', '{{\"url\":\"kept\"}}', 123),
+                        ('other-{table}', 'other', 'pull_request', 'other-key', '{{\"url\":\"other\"}}', 456);"
+                )).unwrap();
+            }
+            drop(conn);
+            trim_export_database(&database.path, &["kept".into()], &HashSet::new()).unwrap();
+            let trimmed = Connection::open(&database.path).unwrap();
+            for (table, _) in &tables {
+                let rows = trimmed.prepare(&format!("SELECT thread_id, payload FROM {table}")).unwrap()
+                    .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))
+                    .unwrap().collect::<Result<Vec<_>, _>>().unwrap();
+                assert_eq!(rows, vec![("kept".into(), "{\"url\":\"kept\"}".into())]);
+            }
+            for (table, column, expected) in [
+                ("threads", "id", "kept"), ("projects", "id", "kept-project"),
+                ("project_roots", "project_id", "kept-project"), ("thread_sections", "id", "kept-section"),
+                ("thread_dynamic_tools", "thread_id", "kept"),
+            ] {
+                let values = trimmed.prepare(&format!("SELECT {column} FROM {table}")).unwrap()
+                    .query_map([], |row| row.get::<_, String>(0)).unwrap()
+                    .collect::<Result<Vec<_>, _>>().unwrap();
+                assert_eq!(values, vec![expected], "{table}");
+            }
+            assert_eq!(trimmed.query_row("SELECT COUNT(*) FROM thread_spawn_edges", [], |row| row.get::<_, i64>(0)).unwrap(), 0);
+            assert!(!database_table_exists(&trimmed, "main", "_sqlx_migrations").unwrap());
+            assert_eq!(trimmed.query_row("PRAGMA quick_check", [], |row| row.get::<_, String>(0)).unwrap(), "ok");
+        }
+    }
+
+    #[test]
+    fn copies_attachments_across_versions_for_import_and_delete_restore() {
+        for (schema, scope) in [("imported_package", "importing_thread_ids"), ("deleted_backup", "restored_thread_ids")] {
+            for (source_table, source_type) in THREAD_ATTACHMENT_TABLES {
+                for (target_table, target_type) in THREAD_ATTACHMENT_TABLES {
+                    let mut conn = Connection::open_in_memory().unwrap();
+                    conn.execute_batch(&format!(
+                        "PRAGMA foreign_keys = ON;
+                         ATTACH DATABASE ':memory:' AS {schema};
+                         CREATE TABLE main.threads (id TEXT PRIMARY KEY, title TEXT, creator_user_id TEXT, history_mode TEXT NOT NULL DEFAULT 'legacy');
+                         CREATE TABLE {schema}.threads (title TEXT, id TEXT PRIMARY KEY);
+                         INSERT INTO {schema}.threads VALUES ('Kept title', 'kept'), ('Other title', 'other');
+                         CREATE TEMP TABLE {scope} (id TEXT PRIMARY KEY);
+                         INSERT INTO {scope} VALUES ('kept');"
+                    )).unwrap();
+                    create_attachment_table(&conn, schema, source_table, source_type);
+                    create_attachment_table(&conn, "main", target_table, target_type);
+                    conn.execute_batch(&format!(
+                        "INSERT INTO {schema}.{source_table} VALUES
+                            ('kept-attachment', 'kept', 'pull_request', 'key', '{{\"url\":\"kept\"}}', 123),
+                            ('other-attachment', 'other', 'worktree', 'other-key', '{{\"root\":\"other\"}}', 456);"
+                    )).unwrap();
+                    let transaction = conn.transaction().unwrap();
+                    copy_database_rows(&transaction, schema, "threads", &format!("id IN (SELECT id FROM {scope})"), false).unwrap();
+                    copy_thread_attachments(&transaction, schema, scope).unwrap();
+                    transaction.commit().unwrap();
+                    let thread: (String, String, Option<String>, String) = conn.query_row(
+                        "SELECT id, title, creator_user_id, history_mode FROM main.threads", [],
+                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                    ).unwrap();
+                    assert_eq!(thread, ("kept".into(), "Kept title".into(), None, "legacy".into()));
+                    let mut statement = conn.prepare(&format!("SELECT id, thread_id, {target_type}, identity_key, payload, created_at FROM main.{target_table}")).unwrap();
+                    let rows = statement.query_map([], |row| Ok((
+                        row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?, row.get::<_, String>(4)?, row.get::<_, i64>(5)?,
+                    ))).unwrap().collect::<Result<Vec<_>, _>>().unwrap();
+                    assert_eq!(rows, vec![("kept-attachment".into(), "kept".into(), "pull_request".into(), "key".into(), "{\"url\":\"kept\"}".into(), 123)]);
+                    assert!(!database_table_exists(&conn, "main", if target_table == "thread_artifacts" { "thread_attachments" } else { "thread_artifacts" }).unwrap());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn allows_attachment_free_packages_and_unselected_attachments() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "ATTACH DATABASE ':memory:' AS imported_package;
+             CREATE TABLE imported_package.threads (id TEXT PRIMARY KEY);
+             INSERT INTO imported_package.threads VALUES ('other');
+             CREATE TEMP TABLE importing_thread_ids (id TEXT PRIMARY KEY);
+             INSERT INTO importing_thread_ids VALUES ('kept');"
+        ).unwrap();
+        copy_thread_attachments(&conn, "imported_package", "importing_thread_ids").unwrap();
+        create_attachment_table(&conn, "imported_package", "thread_attachments", "attachment_type");
+        conn.execute_batch("INSERT INTO imported_package.thread_attachments VALUES ('other-attachment', 'other', 'worktree', 'key', '{}', 123)").unwrap();
+        copy_thread_attachments(&conn, "imported_package", "importing_thread_ids").unwrap();
+        create_attachment_table(&conn, "main", "thread_attachments", "attachment_type");
+        conn.execute_batch("DROP TABLE imported_package.thread_attachments").unwrap();
+        copy_thread_attachments(&conn, "imported_package", "importing_thread_ids").unwrap();
+        assert_eq!(conn.query_row("SELECT COUNT(*) FROM thread_attachments", [], |row| row.get::<_, i64>(0)).unwrap(), 0);
+    }
+
+    #[test]
+    fn rejects_attachment_loss_and_rolls_back_copied_threads() {
+        for (schema, scope) in [("imported_package", "importing_thread_ids"), ("deleted_backup", "restored_thread_ids")] {
+            let mut conn = Connection::open_in_memory().unwrap();
+            conn.execute_batch(&format!(
+                "ATTACH DATABASE ':memory:' AS {schema};
+                 CREATE TABLE main.threads (id TEXT PRIMARY KEY);
+                 CREATE TABLE {schema}.threads (id TEXT PRIMARY KEY);
+                 INSERT INTO {schema}.threads VALUES ('kept');
+                 CREATE TEMP TABLE {scope} (id TEXT PRIMARY KEY);
+                 INSERT INTO {scope} VALUES ('kept');"
+            )).unwrap();
+            create_attachment_table(&conn, schema, "thread_artifacts", "artifact_type");
+            conn.execute_batch(&format!("INSERT INTO {schema}.thread_artifacts VALUES ('attachment', 'kept', 'worktree', 'key', '{{}}', 123)")).unwrap();
+            {
+                let transaction = conn.transaction().unwrap();
+                copy_database_rows(&transaction, schema, "threads", &format!("id IN (SELECT id FROM {scope})"), false).unwrap();
+                let error = copy_thread_attachments(&transaction, schema, scope).unwrap_err();
+                assert!(error.contains("不支持会话附件"), "{error}");
+            }
+            assert_eq!(conn.query_row("SELECT COUNT(*) FROM main.threads", [], |row| row.get::<_, i64>(0)).unwrap(), 0);
+        }
+    }
+
+    #[test]
+    fn copying_rows_keeps_named_values_and_existing_project_conflicts() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "ATTACH DATABASE ':memory:' AS imported_package;
+             CREATE TABLE main.projects (id TEXT PRIMARY KEY, name TEXT NOT NULL, position INTEGER NOT NULL DEFAULT 0);
+             CREATE TABLE imported_package.projects (name TEXT NOT NULL, id TEXT PRIMARY KEY, newer_field TEXT);
+             INSERT INTO main.projects VALUES ('existing', 'Local name', 5);
+             INSERT INTO imported_package.projects VALUES ('Exported name', 'existing', 'metadata'), ('New name', 'new', 'metadata'), ('Other name', 'other', 'metadata');"
+        ).unwrap();
+        copy_database_rows(&conn, "imported_package", "projects", "id IN ('existing', 'new')", true).unwrap();
+        let rows = conn.prepare("SELECT id, name, position FROM main.projects ORDER BY id").unwrap()
+            .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, i64>(2)?)))
+            .unwrap().collect::<Result<Vec<_>, _>>().unwrap();
+        assert_eq!(rows, vec![("existing".into(), "Local name".into(), 5), ("new".into(), "New name".into(), 0)]);
+    }
+
+    #[test]
+    fn copying_rows_rejects_missing_tables_and_required_fields() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "ATTACH DATABASE ':memory:' AS imported_package;
+             CREATE TABLE main.projects (id TEXT PRIMARY KEY, required_field TEXT NOT NULL);
+             CREATE TABLE imported_package.projects (id TEXT PRIMARY KEY);
+             INSERT INTO imported_package.projects VALUES ('project');"
+        ).unwrap();
+        assert!(copy_database_rows(&conn, "imported_package", "projects", "1", true).unwrap_err().contains("required_field"));
+        assert!(copy_database_rows(&conn, "imported_package", "threads", "1", false).unwrap_err().contains("缺少 threads 表"));
+        assert_eq!(conn.query_row("SELECT COUNT(*) FROM main.projects", [], |row| row.get::<_, i64>(0)).unwrap(), 0);
+    }
+
     #[test]
     #[ignore = "requires a populated local Codex database; run explicitly with --ignored"]
     fn audit_counts_only_sidebar_visible_sessions() {
@@ -2637,31 +3156,27 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires local Codex data with a session assigned across a migrated root"]
     fn audit_keeps_sessions_with_their_project_after_a_root_change() {
-        let home = codex_home().expect("Codex home should exist for the local integration test");
-        let database = state_database(&home).expect("Codex state database should exist");
-        let conn = Connection::open_with_flags(&database, OpenFlags::SQLITE_OPEN_READ_ONLY)
-            .expect("state database should be readable");
-        let projects = query_projects(&conn).expect("projects should be queryable");
-        let assignments = load_desktop_project_assignments(&home);
-        let threads = query_threads(&conn).expect("threads should be queryable");
-        let audit = report().expect("audit should scan the local Codex store");
-
-        let migrated = threads.iter().find(|thread| {
-            thread.source == "vscode"
-                && assignments.contains_key(&thread.id)
-                && effective_project_id(thread, &projects, &assignments).is_some_and(|project_id| {
-                    projects.iter().find(|project| project.id == project_id)
-                        .is_some_and(|project| !project.roots.iter().any(|root| is_same_path(root, &thread.cwd)))
-                })
-        }).expect("the local data should contain a session assigned across a migrated root");
-
-        let expected_project = effective_project_id(migrated, &projects, &assignments).unwrap();
-        let audited = audit.sessions.iter().find(|session| session.id == migrated.id)
-            .expect("migrated visible session should appear in the audit");
-        assert_eq!(audited.project_id.as_deref(), Some(expected_project.as_str()));
+        let database = TemporaryDatabase::new();
+        let home = &database.folder;
+        fs::create_dir(home.join("sessions")).unwrap();
+        let log = home.join("sessions/session.jsonl");
+        fs::write(&log, "{\"type\":\"session_meta\",\"payload\":{\"id\":\"migrated\",\"cwd\":\"/old-root\"}}\n").unwrap();
+        let conn = Connection::open(&database.path).unwrap();
+        conn.execute_batch("CREATE TABLE projects(id TEXT PRIMARY KEY,name TEXT,position INTEGER); CREATE TABLE project_roots(project_id TEXT,position INTEGER,path TEXT);
+            CREATE TABLE threads(id TEXT PRIMARY KEY,name TEXT,title TEXT,source TEXT,cwd TEXT,archived INTEGER,rollout_path TEXT,project_id TEXT,recency_at_ms INTEGER);
+            INSERT INTO projects VALUES('current-project','Migrated project',0); INSERT INTO project_roots VALUES('current-project',0,'/new-root')").unwrap();
+        conn.execute("INSERT INTO threads VALUES('migrated',NULL,'Session','vscode','/old-root',0,?1,NULL,1)", params![display_path(&log)]).unwrap();
+        fs::write(home.join(".codex-global-state.json"), serde_json::json!({
+            "thread-project-assignments":{"migrated":{"projectKind":"local","projectId":"legacy-project"}},
+            "app-server-project-id-by-legacy-project-id-by-host":{"local":{"legacy-project":"current-project"}}
+        }).to_string()).unwrap();
+        let audit = report_at(home).unwrap();
+        let audited = audit.sessions.iter().find(|session| session.id == "migrated").unwrap();
+        assert_eq!(audited.project_id.as_deref(), Some("current-project"));
         assert_eq!(audited.status, "mismatch");
+        assert_eq!(audit.projects[0].session_count, 1);
+        assert_eq!(audit.projects[0].issue_count, 1);
     }
 
     #[test]
@@ -2789,16 +3304,16 @@ mod tests {
     fn migration_updates_only_cwd_fields_and_keeps_file_links() {
         let old = "/Users/knight/Desktop/Test";
         let target = "/Users/knight/Desktop/Test2";
-        let mut value = serde_json::json!({
-            "cwd": old,
-            "message": "[Test1](</Users/knight/Desktop/Test/Test1.md>)",
-            "nested": { "cwd": old }
-        });
-        let count = replace_path_values(&mut value, &HashSet::from([old.to_string()]), target);
-        let rewritten = value.to_string();
-        assert_eq!(count, 2);
+        let database = TemporaryDatabase::new();
+        let log = database.folder.join("session.jsonl");
+        let message = "{\"type\":\"response_item\",\"payload\":{\"cwd\":\"/Users/knight/Desktop/Test\",\"message\":\"[Test1](</Users/knight/Desktop/Test/Test1.md>)\"}}\n";
+        fs::write(&log, format!("{{\"type\":\"session_meta\",\"payload\":{{\"cwd\":\"{old}\"}}}}\n{message}")).unwrap();
+        let rewrite = prepare_log_rewrite(&log, &HashSet::from([old.to_string()]), target).unwrap();
+        let rewritten = rewrite.contents;
+        assert_eq!(rewrite.replacements, 1);
         assert!(rewritten.contains("\"cwd\":\"/Users/knight/Desktop/Test2\""));
         assert!(rewritten.contains("/Users/knight/Desktop/Test/Test1.md"));
+        assert!(rewritten.ends_with(message));
     }
 
     #[test]
@@ -2822,6 +3337,8 @@ mod tests {
                 session_title: "子代理".into(),
                 source_cwd: "/old-child".into(),
                 target_cwd: "/new".into(),
+                sandbox_policy: None,
+                desktop_path_settings: HashMap::new(),
             }],
             rolled_back_at: None,
         };
@@ -2995,7 +3512,9 @@ mod tests {
         assert!(resolved.desktop_project_id.starts_with("local-"));
 
         let assignments = HashMap::from([("thread-test".into(), Some(source_project_id))]);
-        assert_eq!(write_desktop_import_state(plan, &assignments).unwrap(), 1);
+        let mut plan = plan;
+        assert_eq!(update_desktop_import_state(&mut plan, &assignments).unwrap(), 1);
+        atomic_write(&plan.state_path, &plan.state.to_string()).unwrap();
         let state: Value = serde_json::from_slice(&fs::read(home.join(".codex-global-state.json")).unwrap()).unwrap();
         assert_eq!(
             state["thread-project-assignments"]["thread-test"]["projectId"].as_str(),

@@ -488,6 +488,7 @@ function exportDialog(): string {
   }).join("");
   return `<div class="modal-backdrop"><section class="modal export-modal" role="dialog" aria-modal="true"><button id="close-export" class="icon-button" aria-label="关闭">×</button>
     <h2>选择导出的项目会话</h2>
+    <p class="confirmation-note">导出前请完全退出 Codex，以保证会话内容完整。</p>
     <section class="export-workspace">
       <aside class="project-list export-project-list"><div class="side-title">Codex 项目</div><div class="project-filters">${projectButtons}</div></aside>
       <div class="export-table-panel">
